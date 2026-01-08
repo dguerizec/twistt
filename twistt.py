@@ -14,6 +14,9 @@
 #     "openai",
 #     "janus",
 #     "rich",
+#     "fastapi",
+#     "uvicorn",
+#     "pynput",
 # ]
 # ///
 
@@ -52,6 +55,7 @@ from janus import SyncQueueShutDown
 from openai import AsyncOpenAI
 from platformdirs import user_config_dir
 from pydotool import (
+    BTN_MIDDLE,
     DOWN,
     KEY_BACKSPACE,
     KEY_DELETE,
@@ -72,6 +76,10 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.rule import Rule
 from rich.text import Text
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from pynput import keyboard as pynput_keyboard
 
 
 class ConsoleWithLogging:
@@ -167,11 +175,20 @@ class OutputMode(Enum):
         return self is OutputMode.FULL
 
 
+class PasteMethod(Enum):
+    CLIPBOARD = "clipboard"  # Ctrl+V (uses CLIPBOARD selection)
+    PRIMARY = "primary"  # Middle-click (uses PRIMARY selection, better for terminals)
+    XDOTOOL = "xdotool"  # xdotool type (X11, respects layout, works via Barrier)
+
+
 class Config:
     class HotKey(NamedTuple):
-        device: InputDevice
-        codes: list[int]
+        device: InputDevice | None  # None when using pynput
+        codes: list[int]  # evdev codes (empty when using pynput)
+        key_names: list[str]  # hotkey names like "f12"
         double_tap_window: float
+        use_pynput: bool  # True when fallback to pynput
+        disabled: bool  # True when --no-hotkey is used (API-only mode)
 
     class Capture(NamedTuple):
         gain: float
@@ -199,6 +216,11 @@ class Config:
         use_typing: bool
         active: bool
         keyboard_delay_ms: int
+        paste_method: PasteMethod
+
+    class Server(NamedTuple):
+        port: int
+        enabled: bool
 
     class App(NamedTuple):
         console: ConsoleWithLogging
@@ -207,6 +229,8 @@ class Config:
         transcription: Config.Transcription
         post: Config.PostTreatment
         output: Config.Output
+        server: Config.Server
+        indicator_enabled: bool
 
 
 class CommandLineParser:
@@ -234,8 +258,12 @@ class CommandLineParser:
         "output_mode": f"{ENV_PREFIX}OUTPUT_MODE",
         "double_tap_window": f"{ENV_PREFIX}DOUBLE_TAP_WINDOW",
         "use_typing": f"{ENV_PREFIX}USE_TYPING",
+        "paste_method": f"{ENV_PREFIX}PASTE_METHOD",
         "keyboard": f"{ENV_PREFIX}KEYBOARD",
         "keyboard_delay": f"{ENV_PREFIX}KEYBOARD_DELAY",
+        "server_port": f"{ENV_PREFIX}SERVER_PORT",
+        "no_server": f"{ENV_PREFIX}SERVER_DISABLED",
+        "use_pynput": f"{ENV_PREFIX}USE_PYNPUT",
     }
 
     @classmethod
@@ -509,6 +537,15 @@ class CommandLineParser:
             help=argparse.SUPPRESS,
         )
         parser.add_argument(
+            "--paste-method",
+            default=default.get("PASTE_METHOD", cls._UNDEFINED),
+            choices=[m.value for m in PasteMethod],
+            help=(
+                f"Paste method: clipboard (Ctrl+V), primary (middle-click), or xdotool (X11 typing, works via Barrier) "
+                f"(env: {prefix}PASTE_METHOD)"
+            ),
+        )
+        parser.add_argument(
             "-kb",
             "--keyboard",
             nargs="?",
@@ -527,6 +564,37 @@ class CommandLineParser:
             "--log",
             default=default.get("LOG", cls._UNDEFINED),
             help=f"Path to log file. Default: {config_dir / 'twistt.log'} (env: {prefix}LOG)",
+        )
+        parser.add_argument(
+            "--server-port",
+            "-sp",
+            type=int,
+            default=default.get("SERVER_PORT", cls._UNDEFINED),
+            help=f"HTTP API server port (env: {prefix}SERVER_PORT)",
+        )
+        parser.add_argument(
+            "--no-server",
+            action="store_true",
+            default=default.get("SERVER_DISABLED", False),
+            help=f"Disable HTTP API server (env: {prefix}SERVER_DISABLED)",
+        )
+        parser.add_argument(
+            "--use-pynput",
+            action="store_true",
+            default=default.get("USE_PYNPUT", False),
+            help=f"Use pynput for keyboard input instead of evdev (env: {prefix}USE_PYNPUT)",
+        )
+        parser.add_argument(
+            "--no-hotkey",
+            action="store_true",
+            default=default.get("NO_HOTKEY", False),
+            help=f"Disable keyboard hotkey detection (use only HTTP API) (env: {prefix}NO_HOTKEY)",
+        )
+        parser.add_argument(
+            "--no-indicator",
+            action="store_true",
+            default=default.get("NO_INDICATOR", False),
+            help=f"Disable '(Twistting...)' indicator (avoids escape sequences in terminals) (env: {prefix}NO_INDICATOR)",
         )
         parser.add_argument(
             "--check",
@@ -682,9 +750,15 @@ class CommandLineParser:
             "OUTPUT_MODE": cls.get_env("OUTPUT_MODE", OutputMode.BATCH.value),
             "DOUBLE_TAP_WINDOW": float(cls.get_env("DOUBLE_TAP_WINDOW", "0.5")),
             "USE_TYPING": cls.get_env_bool("USE_TYPING"),
+            "PASTE_METHOD": cls.get_env("PASTE_METHOD", PasteMethod.CLIPBOARD.value),
             "KEYBOARD": cls.get_env("KEYBOARD"),
             "KEYBOARD_DELAY": int(cls.get_env("KEYBOARD_DELAY", "20")),
             "LOG": cls.get_env("LOG"),
+            "SERVER_PORT": int(cls.get_env("SERVER_PORT", "7777")),
+            "SERVER_DISABLED": cls.get_env("SERVER_DISABLED", "").lower() in ("true", "1", "yes"),
+            "USE_PYNPUT": cls.get_env("USE_PYNPUT", "").lower() in ("true", "1", "yes"),
+            "NO_HOTKEY": cls.get_env("NO_HOTKEY", "").lower() in ("true", "1", "yes"),
+            "NO_INDICATOR": cls.get_env("NO_INDICATOR", "").lower() in ("true", "1", "yes"),
             "CONFIG_PATH": config_path.as_posix(),
         }
 
@@ -820,20 +894,37 @@ class CommandLineParser:
                 )
                 return None
 
-        try:
-            hotkey_codes = cls._parse_hotkeys(args.hotkey)
-        except ValueError as exc:
-            errprint(f"ERROR: {exc}")
-            return None
+        # Parse hotkeys (skip if --no-hotkey)
+        hotkey_codes: list[int] = []
+        hotkey_names: list[str] = []
+        if not args.no_hotkey:
+            if not args.hotkey:
+                errprint("ERROR: Hotkey is required (use -k/--hotkey or set TWISTT_HOTKEY, or use --no-hotkey for API-only mode)")
+                return None
+            try:
+                hotkey_codes = cls._parse_hotkeys(args.hotkey)
+                hotkey_names = [k.strip().lower() for k in args.hotkey.split(",")]
+            except ValueError as exc:
+                errprint(f"ERROR: {exc}")
+                return None
 
-        try:
-            force_keyboard_prompt = args.keyboard is cls._PROMPT_FOR_KEYBOARD
-            keyboard_value = args.keyboard if not force_keyboard_prompt and isinstance(args.keyboard, str) else None
-            keyboard_filter = keyboard_value.strip() if keyboard_value else None
-            keyboard = cls._find_keyboard(filter_text=keyboard_filter, force_prompt=force_keyboard_prompt)
-        except Exception as exc:
-            errprint(f"ERROR: Unable to find keyboard: {exc}")
-            return None
+        # Try evdev keyboard detection, fall back to pynput if it fails (skip if --no-hotkey)
+        use_pynput = args.use_pynput
+        keyboard: InputDevice | None = None
+        if args.no_hotkey:
+            errprint("INFO: Hotkey detection disabled (--no-hotkey), using HTTP API only")
+        elif use_pynput:
+            errprint("INFO: Using pynput for keyboard input (--use-pynput)")
+        else:
+            try:
+                force_keyboard_prompt = args.keyboard is cls._PROMPT_FOR_KEYBOARD
+                keyboard_value = args.keyboard if not force_keyboard_prompt and isinstance(args.keyboard, str) else None
+                keyboard_filter = keyboard_value.strip() if keyboard_value else None
+                keyboard = cls._find_keyboard(filter_text=keyboard_filter, force_prompt=force_keyboard_prompt)
+            except Exception as exc:
+                # Fallback to pynput
+                use_pynput = True
+                errprint(f"INFO: evdev keyboard not available ({exc}), using pynput fallback")
 
         try:
             force_microphone_prompt = args.microphone is cls._PROMPT_FOR_MICROPHONE
@@ -879,10 +970,17 @@ class CommandLineParser:
         config_table.add_row("Language", f"[yellow]{args.language}[/yellow]" if args.language else "[dim]Auto-detect[/dim]")
 
         # Input settings
-        hotkeys_display = ", ".join([k.strip().upper() for k in args.hotkey.split(",")])
-        config_table.add_row("Hotkey" + ("s" if "," in args.hotkey else ""), f"[bold yellow]{hotkeys_display}[/bold yellow]")
-        config_table.add_row("", "[dim]Hold: push-to-talk | Double-tap: toggle mode[/dim]")
-        config_table.add_row("Keyboard", f"[yellow]{keyboard.name}[/yellow]")
+        hotkeys_display = ""
+        if args.no_hotkey:
+            config_table.add_row("Hotkey", "[dim]Disabled (HTTP API only)[/dim]")
+        else:
+            hotkeys_display = ", ".join([k.strip().upper() for k in args.hotkey.split(",")])
+            config_table.add_row("Hotkey" + ("s" if "," in args.hotkey else ""), f"[bold yellow]{hotkeys_display}[/bold yellow]")
+            config_table.add_row("", "[dim]Hold: push-to-talk | Double-tap: toggle mode[/dim]")
+            if use_pynput:
+                config_table.add_row("Keyboard", "[yellow]pynput[/yellow] [dim](fallback mode)[/dim]")
+            else:
+                config_table.add_row("Keyboard", f"[yellow]{keyboard.name}[/yellow]")
         mic_display_name = microphone.name or microphone.id or "microphone"
         config_table.add_row("Microphone", f"[yellow]{mic_display_name}[/yellow]")
         if args.gain != 1.0:
@@ -907,14 +1005,28 @@ class CommandLineParser:
                 config_table.add_row("", f"[dim]Prompt: {preview}[/dim]")
 
         # Output settings
-        output_method = "Type directly (ASCII) (Non ASCII is pasted via clipboard )" if args.use_typing else "Paste via clipboard"
+        output_method = "Type directly (ASCII) (Non ASCII is pasted)" if args.use_typing else "Paste"
+        paste_method = PasteMethod(args.paste_method)
+        if paste_method is PasteMethod.PRIMARY:
+            output_method += " via middle-click (PRIMARY)"
+        elif paste_method is PasteMethod.XDOTOOL:
+            output_method = "Type via xdotool (X11, works via Barrier)"
+        else:
+            output_method += " via Ctrl+V (CLIPBOARD)"
         if post_treatment_configured:
             output_method += " as transcription / post-treatment comes" if output_mode.is_batch else " at end of transcription / post-treatment"
         else:
             output_method += " as transcription comes" if output_mode.is_batch else " at end of transcription"
         config_table.add_row("Output method", f"[yellow]{output_method}[/yellow]")
-        if not args.use_typing:
-            config_table.add_row("", "[dim]Uses Ctrl+V to paste (or Ctrl+Shift+V if Shift is pressed)[/dim]")
+        if not args.use_typing and paste_method is PasteMethod.CLIPBOARD:
+            config_table.add_row("", "[dim]Uses Ctrl+Shift+V if Shift is pressed[/dim]")
+
+        # API server
+        if not args.no_server:
+            config_table.add_row("API server", f"[yellow]http://0.0.0.0:{args.server_port}[/yellow]")
+            config_table.add_row("", "[dim]Endpoints: /api/start, /api/stop, /api/status, /api/ws[/dim]")
+        else:
+            config_table.add_row("API server", "[dim]Disabled[/dim]")
 
         # Files section
         def format_path(path: Path) -> str:
@@ -975,10 +1087,16 @@ class CommandLineParser:
             console.print("[bold green]Configuration check passed![/bold green] Everything looks good.\n")
             return None
 
-        console.print(
-            f"[bold green]Ready![/bold green] Hold (or double tap) [bold yellow]{hotkeys_display}[/bold yellow] to start recording. "
-            f"Press [bold red]Ctrl+C[/bold red] to stop the program.\n"
-        )
+        if args.no_hotkey:
+            console.print(
+                "[bold green]Ready![/bold green] Use HTTP API to start/stop recording. "
+                f"Press [bold red]Ctrl+C[/bold red] to stop the program.\n"
+            )
+        else:
+            console.print(
+                f"[bold green]Ready![/bold green] Hold (or double tap) [bold yellow]{hotkeys_display}[/bold yellow] to start recording. "
+                f"Press [bold red]Ctrl+C[/bold red] to stop the program.\n"
+            )
 
         if args.save_config is True or isinstance(args.save_config, str):
             save_config_path = None
@@ -999,7 +1117,10 @@ class CommandLineParser:
             hotkey=Config.HotKey(
                 device=keyboard,
                 codes=hotkey_codes,
+                key_names=hotkey_names,
                 double_tap_window=args.double_tap_window,
+                use_pynput=use_pynput,
+                disabled=args.no_hotkey,
             ),
             capture=Config.Capture(
                 gain=args.gain,
@@ -1031,7 +1152,13 @@ class CommandLineParser:
                 use_typing=args.use_typing,
                 active=output_enabled,
                 keyboard_delay_ms=args.keyboard_delay,
+                paste_method=PasteMethod(args.paste_method),
             ),
+            server=Config.Server(
+                port=args.server_port,
+                enabled=not args.no_server,
+            ),
+            indicator_enabled=not args.no_indicator,
         )
 
     @classmethod
@@ -1168,7 +1295,7 @@ class CommandLineParser:
                     continue
                 overrides[env_key] = keyboard_name
                 continue
-            if dest in {"post_correct", "use_typing", "no_post"}:
+            if dest in {"post_correct", "use_typing", "no_post", "no_server", "use_pynput"}:
                 overrides[env_key] = "true" if getattr(args, dest) else "false"
                 continue
             value = getattr(args, dest, None)
@@ -1487,6 +1614,24 @@ class Comm:
         self._is_buffer_active = buffer_active
         self._active_hotkey_name: str | None = None
         self._is_hotkey_toggle_mode: bool = False
+        self._state_callbacks: list = []
+
+    def register_state_callback(self, callback) -> None:
+        """Register a callback to be called on state changes."""
+        self._state_callbacks.append(callback)
+
+    def unregister_state_callback(self, callback) -> None:
+        """Unregister a state change callback."""
+        if callback in self._state_callbacks:
+            self._state_callbacks.remove(callback)
+
+    def _notify_state_change(self) -> None:
+        """Notify all registered callbacks of state change."""
+        for callback in self._state_callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
 
     def queue_audio_chunks(self, data: bytes):
         with suppress(SyncQueueShutDown):
@@ -1627,6 +1772,7 @@ class Comm:
             self._active_hotkey_name = None
             self._is_hotkey_toggle_mode = False
         self._send_speech_state_command()
+        self._notify_state_change()
 
     def wait_for_recording_task(self):
         return create_task(self._recording.wait())
@@ -1640,6 +1786,7 @@ class Comm:
             return
         self._is_speech_active = flag
         self._send_speech_state_command()
+        self._notify_state_change()
 
     @property
     def is_keyboard_busy(self):
@@ -1657,6 +1804,7 @@ class Comm:
             return
         self._is_post_treatment_active = flag
         self.queue_display_command(TerminalDisplayTask.Commands.UpdatePostState(active=flag))
+        self._notify_state_change()
 
     @property
     def is_indicator_active(self):
@@ -1791,7 +1939,13 @@ class OutputTask:
         pyperclip.copy(text)
         self._schedule_clipboard_restore()
 
-    def _copy_paste(self, text: str, use_shift_to_paste: bool = False):
+    def _copy_to_primary(self, text: str):
+        """Copy text to PRIMARY selection using xclip."""
+        import subprocess
+        subprocess.run(["xclip", "-selection", "primary"], input=text.encode(), check=True)
+
+    def _clipboard_paste(self, text: str, use_shift_to_paste: bool = False):
+        """Paste via Ctrl+V (CLIPBOARD selection)."""
         self._copy_to_clipboard(text)
         combo = self.Combo.CTRL_SHIFT_V.value if use_shift_to_paste else self.Combo.CTRL_V.value
         key_combination(
@@ -1799,6 +1953,25 @@ class OutputTask:
             each_delay_ms=self._delay_between_keys_ms,
             press_ms=self._delay_between_keys_ms,
         )
+
+    def _primary_paste(self, text: str):
+        """Paste via middle-click (PRIMARY selection)."""
+        self._copy_to_primary(text)
+        key_seq([(BTN_MIDDLE, DOWN), (BTN_MIDDLE, UP)], next_delay_ms=self._delay_between_keys_ms)
+
+    def _xdotool_type(self, text: str):
+        """Type text via xdotool (X11, respects layout, works via Barrier)."""
+        import subprocess
+        subprocess.run(["xdotool", "type", "--clearmodifiers", text], check=True)
+
+    def _copy_paste(self, text: str, use_shift_to_paste: bool = False):
+        """Paste text using configured method."""
+        if self.config.output.paste_method is PasteMethod.PRIMARY:
+            self._primary_paste(text)
+        elif self.config.output.paste_method is PasteMethod.XDOTOOL:
+            self._xdotool_type(text)
+        else:
+            self._clipboard_paste(text, use_shift_to_paste)
 
     def _write_text(self, text: str, use_shift_to_paste: bool = False):
         if not self.config.output.use_typing:
@@ -1960,6 +2133,164 @@ class HotKeyTask:
 
         with suppress(Exception):
             self.config.hotkey.device.close()
+
+
+class PynputHotKeyTask:
+    """Hotkey handler using pynput (fallback when evdev is not available)."""
+
+    # Map pynput F-keys to names
+    PYNPUT_F_KEYS = {
+        pynput_keyboard.Key.f1: "f1",
+        pynput_keyboard.Key.f2: "f2",
+        pynput_keyboard.Key.f3: "f3",
+        pynput_keyboard.Key.f4: "f4",
+        pynput_keyboard.Key.f5: "f5",
+        pynput_keyboard.Key.f6: "f6",
+        pynput_keyboard.Key.f7: "f7",
+        pynput_keyboard.Key.f8: "f8",
+        pynput_keyboard.Key.f9: "f9",
+        pynput_keyboard.Key.f10: "f10",
+        pynput_keyboard.Key.f11: "f11",
+        pynput_keyboard.Key.f12: "f12",
+    }
+
+    def __init__(self, comm: Comm, config: Config.App):
+        self.comm = comm
+        self.config = config
+        self._hotkey_pressed = False
+        self._is_toggle_mode = False
+        self._active_hotkey: pynput_keyboard.Key | None = None
+        self._last_release_time: dict[pynput_keyboard.Key, float] = {}
+        self._toggle_stop_time = 0.0
+        self._toggle_cooldown = 0.5
+        self._listener: pynput_keyboard.Listener | None = None
+        self._stop_event = asyncio.Event()
+
+    def _get_hotkey_keys(self) -> set[pynput_keyboard.Key]:
+        """Convert configured hotkey names to pynput keys."""
+        keys = set()
+        for name in self.config.hotkey.key_names:
+            name_lower = name.lower()
+            for key, key_name in self.PYNPUT_F_KEYS.items():
+                if key_name == name_lower:
+                    keys.add(key)
+                    break
+        return keys
+
+    def _on_press(self, key: pynput_keyboard.Key | pynput_keyboard.KeyCode | None) -> None:
+        if key is None or self.comm.is_shutting_down:
+            return
+
+        hotkey_keys = self._get_hotkey_keys()
+
+        # Handle shift modifier
+        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_l, pynput_keyboard.Key.shift_r):
+            if self.comm.is_recording:
+                self.comm.toggle_shift_pressed(True)
+            return
+
+        # Handle alt modifier
+        if key in (pynput_keyboard.Key.alt, pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r):
+            if self.comm.is_recording:
+                self.comm.toggle_alt_pressed(True)
+            return
+
+        if key not in hotkey_keys:
+            return
+
+        # If another hotkey is active, ignore this one
+        if self._active_hotkey is not None and key != self._active_hotkey:
+            return
+
+        current_time = time.perf_counter()
+
+        if self._hotkey_pressed:
+            # Already pressed - check for toggle mode deactivation
+            if self._is_toggle_mode:
+                self._is_toggle_mode = False
+                self._active_hotkey = None
+                self._hotkey_pressed = False
+                self._toggle_stop_time = current_time
+                name = self.PYNPUT_F_KEYS.get(key, "unknown")
+                print(f"[Toggle mode deactivated with {name.upper()}]")
+                self.comm.toggle_recording(False, None, False)
+            return
+
+        # Check for toggle cooldown
+        if current_time - self._toggle_stop_time < self._toggle_cooldown:
+            return
+
+        # Check for double-tap (toggle mode)
+        last_release = self._last_release_time.get(key, 0.0)
+        if current_time - last_release < self.config.hotkey.double_tap_window:
+            self._is_toggle_mode = True
+            self._active_hotkey = key
+            self._hotkey_pressed = True
+            name = self.PYNPUT_F_KEYS.get(key, "unknown")
+            if not OUTPUT_TO_STDOUT:
+                print(f"[Toggle mode activated with {name.upper()}]")
+            self.comm.toggle_recording(True, name.upper(), True)
+        else:
+            self._is_toggle_mode = False
+            self._hotkey_pressed = True
+            self._active_hotkey = key
+            name = self.PYNPUT_F_KEYS.get(key, "unknown")
+            self.comm.toggle_recording(True, name.upper(), False)
+
+        if not OUTPUT_TO_STDOUT:
+            print(f"\n--- {datetime.now()} ---")
+
+    def _on_release(self, key: pynput_keyboard.Key | pynput_keyboard.KeyCode | None) -> None:
+        if key is None or self.comm.is_shutting_down:
+            return
+
+        hotkey_keys = self._get_hotkey_keys()
+
+        # Handle shift modifier
+        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_l, pynput_keyboard.Key.shift_r):
+            self.comm.toggle_shift_pressed(False)
+            return
+
+        # Handle alt modifier
+        if key in (pynput_keyboard.Key.alt, pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r):
+            self.comm.toggle_alt_pressed(False)
+            return
+
+        if key not in hotkey_keys:
+            return
+
+        current_time = time.perf_counter()
+        self._last_release_time[key] = current_time
+
+        if not self._hotkey_pressed:
+            return
+
+        if self._is_toggle_mode:
+            # In toggle mode, release doesn't stop recording
+            self._hotkey_pressed = False
+            return
+
+        # Normal mode: release stops recording
+        self._hotkey_pressed = False
+        self._active_hotkey = None
+        self.comm.toggle_recording(False, None, False)
+
+    async def run(self) -> None:
+        self._listener = pynput_keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+        )
+        self._listener.start()
+
+        try:
+            # Wait until shutdown
+            while not self.comm.is_shutting_down:
+                await asyncio.sleep(0.1)
+        except CancelledError:
+            pass
+        finally:
+            if self._listener:
+                self._listener.stop()
 
 
 class CaptureTask:
@@ -3491,6 +3822,120 @@ class IndicatorTask:
             self.comm.toggle_indicator_active(False)
 
 
+class ApiTask:
+    """HTTP/WebSocket API server for external control (StreamDeck, etc.)."""
+
+    def __init__(self, comm: Comm, config: Config.App):
+        self.comm = comm
+        self.config = config
+        self._ws_clients: set[WebSocket] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def get_status(self) -> dict:
+        """Get current status matching SoupaWhisper API format."""
+        state = "idle"
+        if self.comm.is_recording:
+            state = "recording"
+        elif self.comm.is_post_treatment_active or self.comm.is_speech_active:
+            state = "processing"
+        return {
+            "state": state,
+            "pipeline_override": None,  # Single channel for now
+        }
+
+    def broadcast_state(self) -> None:
+        """Broadcast current state to all WebSocket clients."""
+        if not self._ws_clients or not self._loop:
+            return
+
+        message = json.dumps(self.get_status())
+
+        async def send_to_all() -> None:
+            for ws in list(self._ws_clients):
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    self._ws_clients.discard(ws)
+
+        asyncio.run_coroutine_threadsafe(send_to_all(), self._loop)
+
+    def create_app(self) -> FastAPI:
+        """Create FastAPI application with endpoints."""
+        app = FastAPI(title="Twistt", version="1.0.0")
+
+        @app.get("/api/status")
+        async def get_status() -> dict:
+            return self.get_status()
+
+        @app.get("/api/pipelines")
+        async def get_pipelines() -> list:
+            # Single channel for now, return empty list
+            return []
+
+        @app.post("/api/start")
+        async def start_recording(body: dict | None = None) -> JSONResponse:
+            if self.comm.is_recording:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "Already recording"},
+                )
+            # Start recording via Comm (simulates hotkey press)
+            self.comm.toggle_recording(True, "API", False)
+            return JSONResponse(content={"status": "recording"})
+
+        @app.post("/api/stop")
+        async def stop_recording() -> JSONResponse:
+            if not self.comm.is_recording:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "Not recording"},
+                )
+            # Stop recording via Comm (simulates hotkey release)
+            self.comm.toggle_recording(False, None, False)
+            return JSONResponse(content={"status": "stopped"})
+
+        @app.websocket("/api/ws")
+        async def websocket_endpoint(ws: WebSocket) -> None:
+            await ws.accept()
+            self._ws_clients.add(ws)
+            try:
+                # Send initial state
+                await ws.send_text(json.dumps(self.get_status()))
+                # Keep connection alive
+                while True:
+                    try:
+                        await ws.receive_text()
+                    except WebSocketDisconnect:
+                        break
+            finally:
+                self._ws_clients.discard(ws)
+
+        return app
+
+    async def run(self) -> None:
+        """Run the API server."""
+        self._loop = asyncio.get_event_loop()
+
+        # Register broadcast callback with Comm
+        self.comm.register_state_callback(self.broadcast_state)
+
+        app = self.create_app()
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=self.config.server.port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+
+        try:
+            await server.serve()
+        except CancelledError:
+            pass
+        finally:
+            self.comm.unregister_state_callback(self.broadcast_state)
+
+
 async def main_async():
     app_config = CommandLineParser.parse()
     if app_config is None:
@@ -3502,28 +3947,40 @@ async def main_async():
     )
     try:
         async with asyncio.TaskGroup() as tg:
-            hotkey_task = HotKeyTask(comm, app_config)
+            # Choose hotkey handler based on available input method (skip if disabled)
+            hotkey_task = None
+            if not app_config.hotkey.disabled:
+                if app_config.hotkey.use_pynput:
+                    hotkey_task = PynputHotKeyTask(comm, app_config)
+                else:
+                    hotkey_task = HotKeyTask(comm, app_config)
             capture_task = CaptureTask(comm, app_config)
             output_task = OutputTask(comm, app_config)
             buffer_task = BufferTask(comm, app_config)
             transcription_task = (
                 OpenAITranscriptionTask if app_config.transcription.provider is BaseTranscriptionTask.Provider.OPENAI else DeepgramTranscriptionTask
             )(comm, app_config)
-            indicator_task = IndicatorTask(comm)
+            indicator_task = IndicatorTask(comm) if app_config.indicator_enabled else None
             if OUTPUT_TO_STDOUT:
                 terminal_display_task = TerminalDisplayTask(comm, app_config)
                 tg.create_task(terminal_display_task.run())
 
-            tg.create_task(hotkey_task.run())
+            if hotkey_task:
+                tg.create_task(hotkey_task.run())
             tg.create_task(capture_task.run())
             tg.create_task(output_task.run())
             tg.create_task(buffer_task.run())
             tg.create_task(transcription_task.run())
-            tg.create_task(indicator_task.run())
+            if indicator_task:
+                tg.create_task(indicator_task.run())
 
             if app_config.post.configured:
                 post_task = PostTreatmentTask(comm, app_config)
                 tg.create_task(post_task.run())
+
+            if app_config.server.enabled:
+                api_task = ApiTask(comm, app_config)
+                tg.create_task(api_task.run())
 
     except* (KeyboardInterrupt, CancelledError):
         print("\nExit.")
@@ -3532,8 +3989,9 @@ async def main_async():
 
     finally:
         await comm.shutdown()
-        with suppress(Exception):
-            app_config.hotkey.device.close()
+        if app_config.hotkey.device is not None:
+            with suppress(Exception):
+                app_config.hotkey.device.close()
 
 
 def main():

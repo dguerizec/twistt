@@ -10,3 +10,6 @@ python-ydotool
 openai
 janus
 rich
+fastapi
+uvicorn
+pynput
