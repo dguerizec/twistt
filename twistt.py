@@ -940,7 +940,15 @@ class CommandLineParser:
 
         if args.ydotool_socket:
             os.environ["YDOTOOL_SOCKET"] = args.ydotool_socket
-        pydotool_init()
+
+        # Only initialize ydotool if needed (not when using xdotool with no indicator and no typing)
+        needs_ydotool = (
+            PasteMethod(args.paste_method) != PasteMethod.XDOTOOL
+            or not args.no_indicator
+            or args.use_typing
+        )
+        if needs_ydotool:
+            pydotool_init()
 
         # Display configuration using Rich
         from rich.panel import Panel
@@ -1962,7 +1970,7 @@ class OutputTask:
     def _xdotool_type(self, text: str):
         """Type text via xdotool (X11, respects layout, works via Barrier)."""
         import subprocess
-        subprocess.run(["xdotool", "type", "--clearmodifiers", text], check=True)
+        subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text], check=True)
 
     def _copy_paste(self, text: str, use_shift_to_paste: bool = False):
         """Paste text using configured method."""
