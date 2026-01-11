@@ -222,6 +222,9 @@ class Config:
         port: int
         enabled: bool
 
+    class Pipeline(NamedTuple):
+        directory: Path
+
     class App(NamedTuple):
         console: ConsoleWithLogging
         hotkey: Config.HotKey
@@ -230,6 +233,7 @@ class Config:
         post: Config.PostTreatment
         output: Config.Output
         server: Config.Server
+        pipeline: Config.Pipeline
         indicator_enabled: bool
 
 
@@ -597,6 +601,11 @@ class CommandLineParser:
             help=f"Disable '(Twistting...)' indicator (avoids escape sequences in terminals) (env: {prefix}NO_INDICATOR)",
         )
         parser.add_argument(
+            "--pipeline-dir",
+            default=default.get("PIPELINE_DIR"),
+            help=f"Directory for pipeline config files (env: {prefix}PIPELINE_DIR, default: ~/.config/twistt/pipelines/)",
+        )
+        parser.add_argument(
             "--check",
             action="store_true",
             help="Display configuration and exit without logging anything to file",
@@ -759,6 +768,7 @@ class CommandLineParser:
             "USE_PYNPUT": cls.get_env("USE_PYNPUT", "").lower() in ("true", "1", "yes"),
             "NO_HOTKEY": cls.get_env("NO_HOTKEY", "").lower() in ("true", "1", "yes"),
             "NO_INDICATOR": cls.get_env("NO_INDICATOR", "").lower() in ("true", "1", "yes"),
+            "PIPELINE_DIR": cls.get_env("PIPELINE_DIR"),
             "CONFIG_PATH": config_path.as_posix(),
         }
 
@@ -1165,6 +1175,9 @@ class CommandLineParser:
             server=Config.Server(
                 port=args.server_port,
                 enabled=not args.no_server,
+            ),
+            pipeline=Config.Pipeline(
+                directory=Path(args.pipeline_dir) if args.pipeline_dir else Path(user_config_dir("twistt")) / "pipelines",
             ),
             indicator_enabled=not args.no_indicator,
         )
@@ -1623,6 +1636,8 @@ class Comm:
         self._active_hotkey_name: str | None = None
         self._is_hotkey_toggle_mode: bool = False
         self._state_callbacks: list = []
+        self._active_pipeline: str | None = None
+        self._pipeline_overrides: dict[str, str] = {}
 
     def register_state_callback(self, callback) -> None:
         """Register a callback to be called on state changes."""
@@ -1640,6 +1655,30 @@ class Comm:
                 callback()
             except Exception:
                 pass
+
+    @property
+    def active_pipeline(self) -> str | None:
+        """Get the active pipeline name."""
+        return self._active_pipeline
+
+    @property
+    def pipeline_overrides(self) -> dict[str, str]:
+        """Get the active pipeline's config overrides."""
+        return self._pipeline_overrides
+
+    def set_pipeline(self, name: str | None, overrides: dict[str, str] | None = None) -> None:
+        """Set the active pipeline and its config overrides."""
+        self._active_pipeline = name
+        self._pipeline_overrides = overrides or {}
+
+    def clear_pipeline(self) -> None:
+        """Clear the active pipeline."""
+        self._active_pipeline = None
+        self._pipeline_overrides = {}
+
+    def get_pipeline_value(self, key: str, default: str | None = None) -> str | None:
+        """Get a config value from the pipeline overrides, or return default."""
+        return self._pipeline_overrides.get(key, default)
 
     def queue_audio_chunks(self, data: bytes):
         with suppress(SyncQueueShutDown):
@@ -2999,6 +3038,30 @@ ${current_text}
     def _use_post_correction(self) -> bool:
         return self.comm.is_post_enabled and self.config.post.correct and self.config.output.mode.is_batch
 
+    @property
+    def _effective_prompt(self) -> str | None:
+        """Get the effective prompt, checking pipeline overrides first."""
+        override = self.comm.get_pipeline_value("POST_TREATMENT_PROMPT")
+        return override if override is not None else self.config.post.prompt
+
+    @property
+    def _effective_model(self) -> str:
+        """Get the effective model, checking pipeline overrides first."""
+        override = self.comm.get_pipeline_value("POST_MODEL")
+        if override is None:
+            override = self.comm.get_pipeline_value("POST_TREATMENT_MODEL")
+        return override if override is not None else self.config.post.model
+
+    @property
+    def _effective_provider(self) -> "PostTreatmentTask.Provider":
+        """Get the effective provider, checking pipeline overrides first."""
+        override = self.comm.get_pipeline_value("POST_PROVIDER")
+        if override is None:
+            override = self.comm.get_pipeline_value("POST_TREATMENT_PROVIDER")
+        if override is not None:
+            return PostTreatmentTask.Provider(override)
+        return self.config.post.provider
+
     def _next_buffer_seq(self) -> int:
         seq = self._buffer_seq_counter
         self._buffer_seq_counter += 1
@@ -3079,7 +3142,7 @@ ${current_text}
     ) -> AsyncIterator[str | None]:
         system_message = self._render_template(
             self.SYSTEM_TEMPLATE,
-            {"user_prompt": self.config.post.prompt},
+            {"user_prompt": self._effective_prompt},
         )
         if self.config.output.mode.is_full:
             previous_context = "No previous transcription"
@@ -3093,7 +3156,7 @@ ${current_text}
             },
         )
         create_kwargs = {
-            "model": self.config.post.model,
+            "model": self._effective_model,
             "messages": [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
@@ -3101,7 +3164,7 @@ ${current_text}
             # "temperature": 0.1,
             "stream": True,
         }
-        if self.config.post.provider is PostTreatmentTask.Provider.OPENROUTER:
+        if self._effective_provider is PostTreatmentTask.Provider.OPENROUTER:
             create_kwargs["extra_headers"] = self.OPENROUTER_EXTRA_HEADERS
         last_exception: BaseException | None = None
         for attempt in range(self.STREAM_MAX_RETRIES):
@@ -3534,7 +3597,9 @@ class TerminalDisplayTask:
 
     @property
     def post_enabled(self):
-        return self.config.post.configured and self.comm.is_post_enabled
+        # Post-treatment is enabled if configured in main config OR if pipeline provides a prompt
+        configured = self.config.post.configured or "POST_TREATMENT_PROMPT" in self.comm.pipeline_overrides
+        return configured and self.comm.is_post_enabled
 
     async def run(self):
         try:
@@ -3685,6 +3750,22 @@ class TerminalDisplayTask:
         ts = self.current_timestamp or datetime.now()
         title = "Start: " + ts.strftime("%Y-%m-%d %H:%M:%S")
         text = Text(overflow="fold", no_wrap=False)
+
+        # Show pipeline info if active
+        if self.comm.active_pipeline:
+            text.append("[", style="bold magenta")
+            text.append("Pipeline: ", style="bold")
+            text.append(self.comm.active_pipeline, style="yellow")
+            text.append("]\n", style="bold magenta")
+            # Show pipeline overrides
+            overrides = self.comm.pipeline_overrides
+            if overrides:
+                for key, value in overrides.items():
+                    preview = value[:50] + "..." if len(value) > 50 else value
+                    text.append(f"  {key}: ", style="dim")
+                    text.append(f"{preview}\n", style="dim italic")
+            text.append("\n")
+
         text.append("[", style="bold cyan")
         text.append("Speech: ", style="bold")
         text.append(self._speech_state_label(final=final))
@@ -3694,7 +3775,8 @@ class TerminalDisplayTask:
         else:
             text.append("...", style="dim")
 
-        if self.config.post.configured and (self.post_enabled or self.post_text):
+        post_configured = self.config.post.configured or "POST_TREATMENT_PROMPT" in self.comm.pipeline_overrides
+        if post_configured and (self.post_enabled or self.post_text):
             text.append("\n\n")
             text.append("[", style="bold cyan")
             text.append("Post treatment: ", style="bold")
@@ -3740,7 +3822,8 @@ class TerminalDisplayTask:
         return "Idle"
 
     def _post_state_label(self, *, final: bool) -> str:
-        if not self.config.post.configured:
+        configured = self.config.post.configured or "POST_TREATMENT_PROMPT" in self.comm.pipeline_overrides
+        if not configured:
             return "Not configured"
         if not self.comm.is_post_enabled:
             return "Disabled"
@@ -3848,8 +3931,31 @@ class ApiTask:
             state = "processing"
         return {
             "state": state,
-            "pipeline_override": None,  # Single channel for now
+            "pipeline": self.comm.active_pipeline,
         }
+
+    def load_pipeline(self, name: str) -> dict[str, str] | None:
+        """Load a pipeline config file and return its values.
+
+        Returns None if the pipeline file doesn't exist.
+        """
+        pipeline_file = self.config.pipeline.directory / f"{name}.env"
+        if not pipeline_file.exists():
+            return None
+
+        # Load the pipeline file using dotenv
+        from dotenv import dotenv_values
+        values = dotenv_values(pipeline_file)
+
+        # Filter to only TWISTT_ prefixed variables and strip the prefix
+        overrides = {}
+        for key, value in values.items():
+            if value is not None:
+                if key.startswith("TWISTT_"):
+                    overrides[key[7:]] = value  # Strip TWISTT_ prefix
+                else:
+                    overrides[key] = value
+        return overrides
 
     def broadcast_state(self) -> None:
         """Broadcast current state to all WebSocket clients."""
@@ -3877,8 +3983,14 @@ class ApiTask:
 
         @app.get("/api/pipelines")
         async def get_pipelines() -> list:
-            # Single channel for now, return empty list
-            return []
+            """List available pipelines."""
+            pipeline_dir = self.config.pipeline.directory
+            if not pipeline_dir.exists():
+                return []
+            return [
+                f.stem for f in pipeline_dir.glob("*.env")
+                if f.is_file()
+            ]
 
         @app.post("/api/start")
         async def start_recording(body: dict | None = None) -> JSONResponse:
@@ -3887,9 +3999,26 @@ class ApiTask:
                     status_code=409,
                     content={"error": "Already recording"},
                 )
+
+            # Handle pipeline if specified
+            pipeline_name = body.get("pipeline") if body else None
+            if pipeline_name:
+                overrides = self.load_pipeline(pipeline_name)
+                if overrides is None:
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": f"Pipeline '{pipeline_name}' not found"},
+                    )
+                self.comm.set_pipeline(pipeline_name, overrides)
+                # Enable post-treatment if pipeline provides a prompt
+                if "POST_TREATMENT_PROMPT" in overrides:
+                    self.comm.toggle_post_enabled(True)
+            else:
+                self.comm.clear_pipeline()
+
             # Start recording via Comm (simulates hotkey press)
-            self.comm.toggle_recording(True, "API", False)
-            return JSONResponse(content={"status": "recording"})
+            self.comm.toggle_recording(True, pipeline_name or "API", False)
+            return JSONResponse(content={"status": "recording", "pipeline": pipeline_name})
 
         @app.post("/api/stop")
         async def stop_recording() -> JSONResponse:
@@ -3900,6 +4029,8 @@ class ApiTask:
                 )
             # Stop recording via Comm (simulates hotkey release)
             self.comm.toggle_recording(False, None, False)
+            # Clear pipeline after recording stops
+            self.comm.clear_pipeline()
             return JSONResponse(content={"status": "stopped"})
 
         @app.websocket("/api/ws")
@@ -3982,7 +4113,8 @@ async def main_async():
             if indicator_task:
                 tg.create_task(indicator_task.run())
 
-            if app_config.post.configured:
+            # Start post-treatment task if configured OR if API server is enabled (pipelines may provide prompts)
+            if app_config.post.configured or app_config.server.enabled:
                 post_task = PostTreatmentTask(comm, app_config)
                 tg.create_task(post_task.run())
 
