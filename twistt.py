@@ -952,10 +952,12 @@ class CommandLineParser:
             os.environ["YDOTOOL_SOCKET"] = args.ydotool_socket
 
         # Only initialize ydotool if needed (not when using xdotool with no indicator and no typing)
+        # Also need ydotool if server is enabled (pipelines may enable indicator)
         needs_ydotool = (
             PasteMethod(args.paste_method) != PasteMethod.XDOTOOL
             or not args.no_indicator
             or args.use_typing
+            or not args.no_server
         )
         if needs_ydotool:
             pydotool_init()
@@ -3845,13 +3847,27 @@ class IndicatorTask:
         SPEAKING = "speaking"
         POST_TREATMENT = "post_treatment"
 
-    def __init__(self, comm: Comm):
+    def __init__(self, comm: Comm, config: Config.App):
         self.comm = comm
+        self.config = config
         self.current_text: str = ""
         self.initialized = False
         self.last_state: list[IndicatorTask.State] = []
 
+    @property
+    def _is_enabled(self) -> bool:
+        """Check if indicator is enabled, considering pipeline override."""
+        # Check pipeline override first
+        override = self.comm.get_pipeline_value("NO_INDICATOR")
+        if override is not None:
+            return override.lower() not in ("true", "1", "yes")
+        # Fall back to main config
+        return self.config.indicator_enabled
+
     def _build_indicator_text(self) -> str:
+        # Check if indicator is disabled (by config or pipeline override)
+        if not self._is_enabled:
+            return ""
         state: list[IndicatorTask.State] = []
         if self.comm.is_recording:
             state.append(IndicatorTask.State.RECORDING)
@@ -4099,7 +4115,8 @@ async def main_async():
             transcription_task = (
                 OpenAITranscriptionTask if app_config.transcription.provider is BaseTranscriptionTask.Provider.OPENAI else DeepgramTranscriptionTask
             )(comm, app_config)
-            indicator_task = IndicatorTask(comm) if app_config.indicator_enabled else None
+            # Start indicator task if enabled OR if API server is enabled (pipelines may enable indicator)
+            indicator_task = IndicatorTask(comm, app_config) if app_config.indicator_enabled or app_config.server.enabled else None
             if OUTPUT_TO_STDOUT:
                 terminal_display_task = TerminalDisplayTask(comm, app_config)
                 tg.create_task(terminal_display_task.run())
