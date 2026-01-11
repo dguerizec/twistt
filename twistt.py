@@ -1638,8 +1638,11 @@ class Comm:
         self._active_hotkey_name: str | None = None
         self._is_hotkey_toggle_mode: bool = False
         self._state_callbacks: list = []
+        self._transcription_callbacks: list = []  # (pipeline, text, final) -> None
+        self._end_callbacks: list = []  # (pipeline) -> None
         self._active_pipeline: str | None = None
         self._pipeline_overrides: dict[str, str] = {}
+        self._pipeline_pending_end: bool = False  # True when we need to send "end" on idle
 
     def register_state_callback(self, callback) -> None:
         """Register a callback to be called on state changes."""
@@ -1652,9 +1655,54 @@ class Comm:
 
     def _notify_state_change(self) -> None:
         """Notify all registered callbacks of state change."""
+        # Check if we need to send "end" signal (when going idle after recording)
+        is_idle = not self.is_recording and not self.is_post_treatment_active and not self.is_speech_active
+        if is_idle and self._pipeline_pending_end and self._active_pipeline:
+            self.broadcast_end()
+            self._pipeline_pending_end = False
+            self.clear_pipeline()
+
         for callback in self._state_callbacks:
             try:
                 callback()
+            except Exception:
+                pass
+
+    def register_transcription_callback(self, callback) -> None:
+        """Register a callback for transcription broadcasts: callback(pipeline, text, final)."""
+        self._transcription_callbacks.append(callback)
+
+    def unregister_transcription_callback(self, callback) -> None:
+        """Unregister a transcription callback."""
+        if callback in self._transcription_callbacks:
+            self._transcription_callbacks.remove(callback)
+
+    def broadcast_transcription(self, text: str, final: bool) -> None:
+        """Broadcast transcription to registered callbacks."""
+        if not self._active_pipeline:
+            return
+        for callback in self._transcription_callbacks:
+            try:
+                callback(self._active_pipeline, text, final)
+            except Exception:
+                pass
+
+    def register_end_callback(self, callback) -> None:
+        """Register a callback for end signal: callback(pipeline)."""
+        self._end_callbacks.append(callback)
+
+    def unregister_end_callback(self, callback) -> None:
+        """Unregister an end callback."""
+        if callback in self._end_callbacks:
+            self._end_callbacks.remove(callback)
+
+    def broadcast_end(self) -> None:
+        """Broadcast end signal to registered callbacks."""
+        if not self._active_pipeline:
+            return
+        for callback in self._end_callbacks:
+            try:
+                callback(self._active_pipeline)
             except Exception:
                 pass
 
@@ -1677,6 +1725,15 @@ class Comm:
         """Clear the active pipeline."""
         self._active_pipeline = None
         self._pipeline_overrides = {}
+        self._pipeline_pending_end = False
+
+    def mark_pipeline_ending(self) -> None:
+        """Mark that the pipeline session is ending (will send 'end' when idle)."""
+        if self._active_pipeline and self.get_pipeline_value("OUTPUT_TARGET", "").lower() == "websocket":
+            self._pipeline_pending_end = True
+        else:
+            # No websocket output, clear immediately
+            self.clear_pipeline()
 
     def get_pipeline_value(self, key: str, default: str | None = None) -> str | None:
         """Get a config value from the pipeline overrides, or return default."""
@@ -1689,6 +1746,13 @@ class Comm:
     @property
     def is_buffer_active(self) -> bool:
         return self._is_buffer_active
+
+    @property
+    def is_keyboard_output_active(self) -> bool:
+        """Returns True if output should go to keyboard (buffer active and not websocket target)."""
+        if not self._is_buffer_active:
+            return False
+        return self.get_pipeline_value("OUTPUT_TARGET", "").lower() != "websocket"
 
     @property
     def is_post_enabled(self) -> bool:
@@ -2582,9 +2646,11 @@ class BaseTranscriptionTask:
         return (self._display_previous_text + "".join(current_transcription)).strip(" ")
 
     def _send_speech_display(self, text: str, final: bool):
-        if not OUTPUT_TO_STDOUT:
-            return
-        self.comm.queue_display_command(TerminalDisplayTask.Commands.UpdateSpeechText(text=text, final=final))
+        if OUTPUT_TO_STDOUT:
+            self.comm.queue_display_command(TerminalDisplayTask.Commands.UpdateSpeechText(text=text, final=final))
+        # Broadcast to websocket if output target is websocket
+        if self.comm.get_pipeline_value("OUTPUT_TARGET", "").lower() == "websocket":
+            self.comm.broadcast_transcription(text, final)
 
     async def _upsert_buffer_segment(self, text: str) -> int:
         seq = self._active_seq_num
@@ -3132,9 +3198,11 @@ ${current_text}
         self._post_display_text = (final_piece + " ") if final_piece else ""
 
     def _send_post_display(self, text: str, final: bool):
-        if not OUTPUT_TO_STDOUT:
-            return
-        self.comm.queue_display_command(TerminalDisplayTask.Commands.UpdatePostText(text=text, final=final))
+        if OUTPUT_TO_STDOUT:
+            self.comm.queue_display_command(TerminalDisplayTask.Commands.UpdatePostText(text=text, final=final))
+        # Broadcast to websocket if output target is websocket
+        if self.comm.get_pipeline_value("OUTPUT_TARGET", "").lower() == "websocket":
+            self.comm.broadcast_transcription(text, final)
 
     async def _post_process(
         self,
@@ -3514,14 +3582,14 @@ class BufferTask:
                         seq_num=seq_num,
                         text=text,
                         position_cursor_at=position_cursor_at,
-                    ) if self.comm.is_buffer_active:
+                    ) if self.comm.is_keyboard_output_active:
                         await self.manager.insert_segment(seq_num, text, position_cursor_at=position_cursor_at)
 
                     case self.Commands.ApplyCorrection(
                         seq_num=seq_num,
                         corrected_text=corrected_text,
                         position_cursor_at=position_cursor_at,
-                    ) if self.comm.is_buffer_active:
+                    ) if self.comm.is_keyboard_output_active:
                         await self.manager.apply_correction(
                             seq_num,
                             corrected_text,
@@ -3936,6 +4004,7 @@ class ApiTask:
         self.comm = comm
         self.config = config
         self._ws_clients: set[WebSocket] = set()
+        self._pipeline_clients: dict[str, set[WebSocket]] = {}  # pipeline_name -> connected clients
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def get_status(self) -> dict:
@@ -3988,6 +4057,40 @@ class ApiTask:
                     self._ws_clients.discard(ws)
 
         asyncio.run_coroutine_threadsafe(send_to_all(), self._loop)
+
+    def broadcast_transcription(self, pipeline: str, text: str, final: bool) -> None:
+        """Broadcast transcription to clients subscribed to a pipeline."""
+        clients = self._pipeline_clients.get(pipeline)
+        if not clients or not self._loop:
+            return
+
+        message = json.dumps({"type": "transcription", "text": text, "final": final})
+
+        async def send_to_pipeline_clients() -> None:
+            for ws in list(clients):
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    clients.discard(ws)
+
+        asyncio.run_coroutine_threadsafe(send_to_pipeline_clients(), self._loop)
+
+    def broadcast_end(self, pipeline: str) -> None:
+        """Broadcast end signal to clients subscribed to a pipeline."""
+        clients = self._pipeline_clients.get(pipeline)
+        if not clients or not self._loop:
+            return
+
+        message = json.dumps({"type": "end"})
+
+        async def send_end_to_pipeline_clients() -> None:
+            for ws in list(clients):
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    clients.discard(ws)
+
+        asyncio.run_coroutine_threadsafe(send_end_to_pipeline_clients(), self._loop)
 
     def create_app(self) -> FastAPI:
         """Create FastAPI application with endpoints."""
@@ -4045,8 +4148,8 @@ class ApiTask:
                 )
             # Stop recording via Comm (simulates hotkey release)
             self.comm.toggle_recording(False, None, False)
-            # Clear pipeline after recording stops
-            self.comm.clear_pipeline()
+            # Mark pipeline as ending (will be cleared when idle, after sending "end" signal)
+            self.comm.mark_pipeline_ending()
             return JSONResponse(content={"status": "stopped"})
 
         @app.websocket("/api/ws")
@@ -4065,14 +4168,44 @@ class ApiTask:
             finally:
                 self._ws_clients.discard(ws)
 
+        @app.websocket("/api/ws/pipelines/{pipeline_name}")
+        async def pipeline_websocket_endpoint(ws: WebSocket, pipeline_name: str) -> None:
+            # Verify pipeline exists
+            if self.load_pipeline(pipeline_name) is None:
+                await ws.close(code=4004, reason=f"Pipeline '{pipeline_name}' not found")
+                return
+
+            await ws.accept()
+            # Add client to pipeline subscribers
+            if pipeline_name not in self._pipeline_clients:
+                self._pipeline_clients[pipeline_name] = set()
+            self._pipeline_clients[pipeline_name].add(ws)
+
+            try:
+                # Send connected confirmation
+                await ws.send_text(json.dumps({"type": "connected", "pipeline": pipeline_name}))
+                # Keep connection alive
+                while True:
+                    try:
+                        await ws.receive_text()
+                    except WebSocketDisconnect:
+                        break
+            finally:
+                self._pipeline_clients[pipeline_name].discard(ws)
+                # Clean up empty sets
+                if not self._pipeline_clients[pipeline_name]:
+                    del self._pipeline_clients[pipeline_name]
+
         return app
 
     async def run(self) -> None:
         """Run the API server."""
         self._loop = asyncio.get_event_loop()
 
-        # Register broadcast callback with Comm
+        # Register callbacks with Comm
         self.comm.register_state_callback(self.broadcast_state)
+        self.comm.register_transcription_callback(self.broadcast_transcription)
+        self.comm.register_end_callback(self.broadcast_end)
 
         app = self.create_app()
         config = uvicorn.Config(
@@ -4089,6 +4222,8 @@ class ApiTask:
             pass
         finally:
             self.comm.unregister_state_callback(self.broadcast_state)
+            self.comm.unregister_transcription_callback(self.broadcast_transcription)
+            self.comm.unregister_end_callback(self.broadcast_end)
 
 
 async def main_async():

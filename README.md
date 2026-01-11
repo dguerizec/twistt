@@ -172,6 +172,12 @@ TWISTT_OPENROUTER_API_KEY=sk-or-...  # Required if using openrouter provider
 | `--list-configs [DIR]`                         | -                                                   | -                             | List all configuration files found in `~/.config/twistt/` (or DIR if specified) with their variables and exit. API keys are masked, all values are limited to 100 characters.                                            |
 | `-c, --config PATH`                            | `TWISTT_CONFIG`                                     | `~/.config/twistt/config.env` | Load configuration from file(s). Can be specified multiple times or use `::` separator. Later files override earlier ones. Prefix with `::` to include default config. Example: `-c ::fr.env` (default + modifier)      |
 | `-sc, --save-config [PATH]`                    | `TWISTT_CONFIG`                                     | false                         | Persist provided command-line values to a config file (defaults to `~/.config/twistt/config.env` or `TWISTT_CONFIG` if set)                                                                                             |
+| `--paste-method`                               | `TWISTT_PASTE_METHOD`                               | clipboard                     | Method for outputting text: `clipboard`, `primary`, `xdotool`, or `ydotool`                                                                                                                                             |
+| `--no-indicator`                               | `TWISTT_NO_INDICATOR`                               | false                         | Disable the "(Twistting...)" indicator at cursor position                                                                                                                                                               |
+| `--no-hotkey`                                  | `TWISTT_NO_HOTKEY`                                  | false                         | Disable hotkey detection, use HTTP API only                                                                                                                                                                             |
+| `--server-port`                                | `TWISTT_SERVER_PORT`                                | 7777                          | HTTP/WebSocket API server port                                                                                                                                                                                          |
+| `--no-server`                                  | `TWISTT_NO_SERVER`                                  | false                         | Disable the HTTP/WebSocket API server                                                                                                                                                                                   |
+| `--pipeline-dir`                               | `TWISTT_PIPELINE_DIR`                               | `~/.config/twistt/pipelines`  | Directory containing pipeline `.env` files                                                                                                                                                                              |
 
 Selecting a microphone sets the `PULSE_SOURCE` environment variable for Twistt only, so your system default input stays untouched. Run `./twistt.py --microphone` without a value to pick from the list even if an environment variable is set.
 
@@ -605,6 +611,120 @@ export OPENROUTER_API_KEY=sk-or-...
 ```
 
 **Note**: Post-treatment adds a small delay (typically under 1 second) as it processes the text through the AI model.
+
+## API Server & Pipelines
+
+Twistt includes an HTTP/WebSocket API for external control (StreamDeck, automation, etc.).
+
+### Enabling the API Server
+
+```bash
+# Run with API server only (no hotkey)
+./twistt.py --no-hotkey
+
+# Or with both hotkey and API
+./twistt.py --server-port 7777
+```
+
+### Pipelines
+
+Pipelines are pre-configured profiles stored as `.env` files. They allow different post-treatment prompts and output modes per use case.
+
+**Setup:**
+```bash
+# Create pipeline directory
+mkdir -p ~/.config/twistt/pipelines
+
+# Create a brainstorm pipeline
+cat > ~/.config/twistt/pipelines/brainstorm.env << 'EOF'
+TWISTT_POST_TREATMENT_PROMPT=Reformulate these messy thoughts into clear, structured text.
+EOF
+
+# Create a commands pipeline (output to WebSocket)
+cat > ~/.config/twistt/pipelines/commands.env << 'EOF'
+TWISTT_OUTPUT_TARGET=websocket
+TWISTT_POST_TREATMENT_PROMPT=Reformulate as a single imperative command. Remove hesitations, questions, politeness. Return only the command, one sentence.
+TWISTT_NO_INDICATOR=yes
+EOF
+```
+
+**Pipeline parameters:**
+- `TWISTT_POST_TREATMENT_PROMPT` - Post-treatment prompt
+- `TWISTT_POST_TREATMENT_MODEL` - Post-treatment model
+- `TWISTT_POST_TREATMENT_PROVIDER` - Post-treatment provider
+- `TWISTT_OUTPUT_TARGET` - `keyboard` (default) or `websocket`
+- `TWISTT_NO_INDICATOR` - Disable indicator (`yes`/`no`)
+- `TWISTT_PASTE_METHOD` - `clipboard`, `primary`, `xdotool`, or `ydotool`
+
+### HTTP Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | Current state (`idle`, `recording`, `processing`) |
+| `/api/pipelines` | GET | List available pipelines |
+| `/api/start` | POST | Start recording (optional: `{"pipeline": "name"}`) |
+| `/api/stop` | POST | Stop recording |
+
+### WebSocket Endpoints
+
+**Status:** `ws://localhost:7777/api/ws`
+- Broadcasts state changes to all clients
+
+**Pipeline transcription:** `ws://localhost:7777/api/ws/pipelines/{name}`
+- Receives transcription for a specific pipeline (when `OUTPUT_TARGET=websocket`)
+- Messages: `{"type": "transcription", "text": "...", "final": true}`, `{"type": "end"}`
+
+### Example: StreamDeck Integration
+
+```python
+import httpx
+
+# Start recording with brainstorm pipeline
+httpx.post("http://localhost:7777/api/start", json={"pipeline": "brainstorm"})
+
+# Stop recording
+httpx.post("http://localhost:7777/api/stop")
+```
+
+### Example: Voice Command Listener
+
+```python
+import asyncio
+import json
+import websockets
+
+async def command_listener():
+    async with websockets.connect("ws://localhost:7777/api/ws/pipelines/commands") as ws:
+        async for message in ws:
+            data = json.loads(message)
+            if data["type"] == "transcription" and data["final"]:
+                print(f"Command: {data['text']}")
+            elif data["type"] == "end":
+                print("Session ended")
+
+asyncio.run(command_listener())
+```
+
+See `API.md` for complete API documentation.
+
+## Paste Methods
+
+Twistt supports multiple methods for outputting text:
+
+| Method | Option | Description |
+|--------|--------|-------------|
+| `clipboard` | `--paste-method clipboard` | Copy to clipboard, paste with Ctrl+V (default) |
+| `primary` | `--paste-method primary` | Copy to X11 primary selection, paste with middle-click |
+| `xdotool` | `--paste-method xdotool` | Use xdotool for pasting (X11 only, no ydotool needed) |
+| `ydotool` | `--paste-method ydotool` | Use ydotool for pasting (X11 and Wayland) |
+
+```bash
+# Use xdotool (no ydotool daemon required)
+./twistt.py --paste-method xdotool --no-indicator
+
+# Use primary selection (paste with middle-click)
+./twistt.py --paste-method primary
+```
 
 ## Language Support
 
